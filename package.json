@@ -1,0 +1,13 @@
+{
+  "name": "sennin-proxy-render",
+  "version": "1.0.0",
+  "description": "High-performance web proxy for Render",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "jsdom": "^24.0.0"
+  }
+}
