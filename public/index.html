@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sennin Proxy</title>
+    <style>
+        :root {
+            --bg: #050505;
+            --card: #111111;
+            --primary: #3b82f6;
+            --accent: #8b5cf6;
+            --text: #ffffff;
+        }
+        body {
+            margin: 0;
+            font-family: 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        .bg-glow {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at 50% 50%, #1e1b4b 0%, #050505 100%);
+            z-index: -1;
+        }
+        .container {
+            background: var(--card);
+            padding: 40px;
+            border-radius: 20px;
+            border: 1px solid #333;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.8);
+            width: 100%;
+            max-width: 450px;
+            text-align: center;
+        }
+        h1 {
+            font-size: 2.2rem;
+            margin-bottom: 10px;
+            background: linear-gradient(45deg, var(--primary), var(--accent));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        p { color: #888; margin-bottom: 30px; }
+        .input-group { display: flex; flex-direction: column; gap: 15px; }
+        input {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            padding: 15px;
+            border-radius: 10px;
+            color: white;
+            font-size: 1rem;
+            outline: none;
+            transition: 0.3s;
+        }
+        input:focus { border-color: var(--primary); box-shadow: 0 0 10px rgba(59, 130, 246, 0.3); }
+        button {
+            background: linear-gradient(45deg, var(--primary), var(--accent));
+            border: none;
+            padding: 15px;
+            border-radius: 10px;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        button:hover { transform: translateY(-2px); opacity: 0.9; }
+        .footer { margin-top: 30px; font-size: 0.8rem; color: #444; }
+    </style>
+</head>
+<body>
+    <div class="bg-glow"></div>
+    <div class="container">
+        <h1>Sennin Proxy</h1>
+        <p>安全で自由なブラウジングを</p>
+        <div class="input-group">
+            <input type="text" id="url" placeholder="URLを入力 (例: google.com)" autofocus>
+            <button id="go">接続</button>
+        </div>
+        <div class="footer">Powered by Alloy Proxy Core</div>
+    </div>
+    <script>
+        const input = document.getElementById('url');
+        const btn = document.getElementById('go');
+        function launch() {
+            let val = input.value.trim();
+            if (!val) return;
+            if (!val.includes('.') && !val.includes('://')) {
+                val = 'https://www.google.com/search?q=' + encodeURIComponent(val);
+            } else if (!val.startsWith('http')) {
+                val = 'http://' + val;
+            }
+            window.location.href = '/prox?url=' + btoa(val);
+        }
+        btn.onclick = launch;
+        input.onkeypress = e => e.key === 'Enter' && launch();
+    </script>
+</body>
+</html>
