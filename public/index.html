@@ -32,77 +32,127 @@
 <body>
     <div class="toolbar">
         <div style="color:#00e676; font-weight:bold; margin-right:5px;">STEALTH</div>
-        <input type="text" id="urlInput" placeholder="Enter URL (e.g. google.com)" onkeydown="if(event.key==='Enter') requestSite()">
+        <input type="text" id="urlInput" placeholder="Enter Game URL..." onkeydown="if(event.key==='Enter') requestSite()">
         <button onclick="requestSite()">GO</button>
     </div>
     
     <div id="view-container">
         <div class="loader" id="loader"></div>
-        <iframe id="viewer" name="viewer" sandbox="allow-same-origin allow-scripts allow-forms allow-pointer-lock"></iframe>
+        <iframe id="viewer" sandbox="allow-same-origin allow-scripts allow-forms allow-pointer-lock"></iframe>
     </div>
 
     <div class="status-bar" id="status">Ready</div>
 
     <script>
+        const SECRET_KEY = 0xAB;
+        const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+        const ws = new WebSocket(`${protocol}://${location.host}`);
         const viewer = document.getElementById('viewer');
         const status = document.getElementById('status');
         const loader = document.getElementById('loader');
 
-        /**
-         * サーバー側の atob() で正しく解釈されるよう、
-         * Unicode 文字列を UTF-8 として Base64 エンコードする関数
-         */
-        function safeBtoa(str) {
-            return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (match, p1) => {
-                return String.fromCharCode('0x' + p1);
-            }));
-        }
-
-        function requestSite() {
-            let url = document.getElementById('urlInput').value.trim();
-            if (!url) return;
-
-            // プロトコルがない場合は補完（サーバー側のロジックに合わせる）
-            if (!url.startsWith('http')) {
-                url = 'https://' + url;
+        const transform = (data) => {
+            const buf = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+            const result = new Uint8Array(buf.length);
+            for (let i = 0; i < buf.length; i++) {
+                result[i] = buf[i] ^ SECRET_KEY;
             }
+            return result;
+        };
 
-            status.innerText = "Initiating stealth tunnel...";
-            loader.style.display = "block";
-
-            // バックエンドの /prox?url=... エンドポイントを利用
-            // サーバー側は atob(urlParams.get('url')) でデコードするため、標準 Base64 を渡す
+        ws.onmessage = async (e) => {
             try {
-                const encodedUrl = safeBtoa(url);
-                viewer.src = `/prox?url=${encodeURIComponent(encodedUrl)}`;
-            } catch (e) {
-                status.innerText = "Encoding Error";
+                const arrayBuffer = await e.data.arrayBuffer();
+                const decryptedUint8 = transform(new Uint8Array(arrayBuffer));
+                const decryptedText = new TextDecoder().decode(decryptedUint8);
+                const res = JSON.parse(decryptedText);
+                
                 loader.style.display = "none";
-            }
-        }
 
-        viewer.onload = () => {
-            loader.style.display = "none";
-            try {
-                // 同じドメイン内（プロキシ経由）であればパスを表示可能
-                const currentHref = viewer.contentWindow.location.href;
-                if (currentHref !== "about:blank") {
-                    status.innerText = "Connected via Proxy";
+                if (res.error) {
+                    status.innerText = "Error: " + res.error;
+                    return;
                 }
-            } catch (e) {
-                // クロスドメイン制限にかかる場合は詳細を表示できない
-                status.innerText = "Session Active";
+
+                status.innerText = `Loaded: ${res.url} [${res.contentType}]`;
+
+                // Base64からバイナリへ復元
+                const binary = atob(res.body);
+                const array = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    array[i] = binary.charCodeAt(i);
+                }
+                
+                const blob = new Blob([array], {type: res.contentType});
+                const blobUrl = URL.createObjectURL(blob);
+
+                // HTMLの場合はiframeに展開、それ以外（JS/CSSのリクエスト）は各リクエスト元へ返すロジックが必要だが、
+                // 初期ロードは常にHTMLを想定
+                if (res.contentType.includes('text/html')) {
+                    viewer.src = blobUrl;
+                }
+            } catch (err) { 
+                status.innerText = "Processing Error: " + err.message; 
+                loader.style.display = "none";
             }
         };
 
-        // iframe 内からのメッセージ（ナビゲーション等）を処理
+        // 子ウィンドウ（iframe内）からの通信リクエストやナビゲーションを横取りするメッセージリスナー
         window.addEventListener('message', (e) => {
-            if (e.data && e.data.type === 'nav') {
-                document.getElementById('urlInput').value = e.data.url;
-                requestSite();
+            if (e.data.type === 'nav' || e.data.type === 'fetch') {
+                const targetUrl = e.data.url;
+                if (e.data.type === 'nav') {
+                    document.getElementById('urlInput').value = targetUrl;
+                }
+                requestSite(targetUrl);
             }
         });
+
+        function requestSite(overrideUrl = null) {
+            let url = overrideUrl || document.getElementById('urlInput').value;
+            if (!url) return;
+            if (!url.startsWith('http')) url = 'https://' + url;
+            
+            status.innerText = "Tunneling request...";
+            loader.style.display = "block";
+            
+            ws.send(transform(JSON.stringify({ 
+                url, 
+                method: 'GET',
+                headers: {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+                }
+            })));
+        }
+
+        viewer.onload = () => {
+            try {
+                const doc = viewer.contentDocument || viewer.contentWindow.document;
+                
+                // リンクのクリックを検知して親経由に飛ばす
+                doc.querySelectorAll('a').forEach(el => {
+                    el.onclick = (ev) => {
+                        const href = el.href;
+                        if (href && !href.startsWith('javascript:') && !href.startsWith('#')) {
+                            ev.preventDefault();
+                            window.parent.postMessage({type: 'nav', url: href}, '*');
+                        }
+                    };
+                });
+
+                // フォーム送信の横取り
+                doc.querySelectorAll('form').forEach(form => {
+                    form.onsubmit = (ev) => {
+                        ev.preventDefault();
+                        const action = new URL(form.action, doc.baseURI).href;
+                        window.parent.postMessage({type: 'nav', url: action}, '*');
+                    };
+                });
+            } catch(e) {
+                // クロスドメイン制限がある場合はリライト側で解消されているはずだが念のため
+                console.log("Safe-mode: Interception handled by server-side injection.");
+            }
+        };
     </script>
 </body>
 </html>
-
