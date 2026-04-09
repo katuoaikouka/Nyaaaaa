@@ -1,350 +1,168 @@
+const express = require('express');
 const http = require('http');
-const https = require('https');
-const fs = require('fs');
-const path = require('path');
-const zlib = require('zlib');
-const querystring = require('querystring');
 const WebSocket = require('ws');
-const { JSDOM } = require('jsdom');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
-// --- ユーティリティ関数 ---
-const btoa = str => Buffer.from(str).toString('base64');
-const atob = str => Buffer.from(str, 'base64').toString('utf-8');
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-// --- 設定 ---
-const config = {
-    prefix: "/web/",
-    port: process.env.PORT || 8080
+const SECRET_KEY = 0xAB; 
+
+// 既存の難読化（XOR）
+const transform = (buf) => Buffer.from(buf).map(b => b ^ SECRET_KEY);
+
+// CSS内の url() 指定を正規化する補助関数
+const rewriteCSS = (css, targetUrl) => {
+    return css.replace(/url\(['"]?([^'"]+)['"]?\)/g, (match, p1) => {
+        try {
+            if (p1.startsWith('data:') || p1.startsWith('http')) return match;
+            return `url("${new URL(p1, targetUrl).href}")`;
+        } catch(e) {
+            return match;
+        }
+    });
 };
 
-// --- クライアント側注入スクリプト (window.js) ---
-const WINDOW_JS = `
-(function() {
-    var alloy = JSON.parse(atob(document.currentScript.getAttribute('data-config')));
-    alloy.url = new URL(alloy.url);
+// JS内の文字列に含まれるパスっぽい部分を雑に置換（簡易実装）
+const rewriteJS = (js, targetUrl) => {
+    // 完全に解析するのは困難なため、明らかな相対パスの文字列などを置換
+    // ここでは主に通信の横取り（Hook）がメインとなるため、補助的な処理
+    return js; 
+};
 
-    // "document.location" and "window.location" are rewritten server-side and replaced with this object.
-    window.alloyLocation = new Proxy({}, {
-        set(obj, prop, value) {
-            if (prop == 'assign' || prop == 'reload' || prop == 'replace' || prop == 'toString') return true;
-            console.log(proxify.url(alloy.url.href.replace(alloy.url[prop], value)));
-            return location[prop] = proxify.url(alloy.url.href.replace(alloy.url[prop], value));
-        },
-        get(obj, prop) {
-            // Discord support fix
-            if (alloy.url.origin == atob('aHR0cHM6Ly9kaXNjb3JkLmNvbQ==') && alloy.url.pathname == '/app') return window.location[prop];
+// リソース書き換え機能: HTML、CSS、JS内のパスを正規化およびフックの注入
+const rewriteResources = (content, targetUrl, contentType) => {
+    // HTMLのリライト
+    if (contentType.includes('text/html')) {
+        const $ = cheerio.load(content);
+        const urlObj = new URL(targetUrl);
 
-            if (prop == 'assign' || prop == 'reload' || prop == 'replace' || prop == 'toString') return {
-                assign: arg => window.location.assign(proxify.url(arg)),
-                replace: arg => window.location.replace(proxify.url(arg)),
-                reload: () => window.location.reload(),
-                toString: () => { return alloy.url.href }
-            }[prop];
-            else return alloy.url[prop];
-        }    
-    });
-
-    window.document.alloyLocation = window.alloyLocation;
-
-    Object.defineProperty(document, 'domain', {
-        get() { return alloy.url.hostname; },
-        set(value) { return value; }
-    });
-
-    var proxify = {
-        url: (url, type) => {
-            if (!url || url.match(/^(#|about:|data:|blob:|mailto:|javascript:|{|\*)/) || url.startsWith(alloy.prefix) || url.startsWith(window.location.origin + alloy.prefix)) return url;
-
-            if (url.startsWith(window.location.origin + '/') && !url.startsWith(window.location.origin + alloy.prefix)) url = '/' + url.split('/').splice(3).join('/');
-            if (url.startsWith('//')) url = 'http:' + url;
-            if (url.startsWith('/') && !url.startsWith(alloy.prefix)) url = alloy.url.origin + url;
-
-            try {
-                var u = new URL(url, alloy.url.href);
-                // Alloy URL Format: prefix + _b64origin_ + /path
-                return alloy.prefix + '_' + btoa(u.origin) + '_' + "/" + u.pathname + u.search + u.hash;
-            } catch(e) { return url; }
-        }
-    };
-
-    // Proxify Element Attributes
-    const proxifyAttribute = (element_array, attribute_array) => {
-        element_array.forEach(element => {
-            if (element && element.prototype) {
-                const oldSetAttribute = element.prototype.setAttribute;
-                element.prototype.setAttribute = function(name, value) {
-                    if (attribute_array.includes(name.toLowerCase())) value = proxify.url(value);
-                    return oldSetAttribute.apply(this, [name, value]);
-                };
-                attribute_array.forEach(attr => {
-                    Object.defineProperty(element.prototype, attr, {
-                        set(value) { this.setAttribute(attr, value); },
-                        get() { return this.getAttribute(attr); }
-                    });
-                });
-            }
-        });
-    };
-
-    proxifyAttribute([window.HTMLAnchorElement, window.HTMLLinkElement, window.HTMLAreaElement], ['href']);
-    proxifyAttribute([window.HTMLScriptElement, window.HTMLIFrameElement, window.HTMLImageElement, window.HTMLVideoElement, window.HTMLAudioElement, window.HTMLSourceElement], ['src']);
-
-    // Fetch / XHR / WebSocket Proxying
-    let oldFetch = window.fetch;
-    window.fetch = function(url, options) {
-        if (url) url = proxify.url(url);
-        return oldFetch.apply(this, arguments);
-    };
-
-    let oldOpen = window.XMLHttpRequest.prototype.open;
-    window.XMLHttpRequest.prototype.open = function(method, url) {
-        if (url) url = proxify.url(url);
-        return oldOpen.apply(this, arguments);
-    };
-
-    window.WebSocket = new Proxy(window.WebSocket, {
-        construct(target, args) {
-            var protocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
-            var originalUrl = args;
-            args = protocol + location.host + alloy.prefix + '?ws=' + btoa(originalUrl) + '&origin=' + btoa(alloy.url.origin);
-            return Reflect.construct(target, args);
-        }
-    });
-
-    // History API Proxying
-    const oldPush = window.History.prototype.pushState;
-    window.History.prototype.pushState = function(state, title, url) {
-        if (url) url = proxify.url(url);
-        return oldPush.apply(this, [state, title, url]);
-    };
-
-    document.currentScript.remove();
-})();
-`;
-
-// --- プロキシコアクラス ---
-class AlloyProxy {
-    constructor(prefix) {
-        this.prefix = prefix;
-    }
-
-    // URLのエンコード・デコード
-    proxifyRequestURL(url, decode) {
-        if (decode) {
-            // フォーマット: _BASE64ORIGIN_/PATH
-            const parts = url.split('_');
-            if (parts.length < 3) throw new Error("Invalid Proxy URL");
-            const origin = atob(parts);
-            const rest = parts.slice(2).join('_');
-            return origin + rest;
-        }
-        const u = new URL(url);
-        return `_${btoa(u.origin)}_${u.pathname}${u.search}${u.hash}`;
-    }
-
-    http(req, res) {
-        const pathSuffix = req.url.replace(this.prefix, '');
-
-        // クライアントスクリプトの配信
-        if (pathSuffix.startsWith('client_hook')) {
-            res.setHeader('Content-Type', 'application/javascript');
-            return res.end(WINDOW_JS);
-        }
-
-        let targetUrl;
-        try {
-            targetUrl = this.proxifyRequestURL(pathSuffix, true);
-        } catch (e) {
-            res.writeHead(400);
-            return res.end("Invalid Proxy URL Format");
-        }
-
-        const proxyUrl = new URL(targetUrl);
-        const protocol = proxyUrl.protocol === 'https:' ? https : http;
-
-        const options = {
-            method: req.method,
-            headers: { ...req.headers },
-            rejectUnauthorized: false
-        };
-
-        // 不要なヘッダーの削除と調整
-        delete options.headers['host'];
-        options.headers['origin'] = proxyUrl.origin;
-        options.headers['referer'] = proxyUrl.href;
-
-        const proxyReq = protocol.request(targetUrl, options, (proxyRes) => {
-            let body = [];
-            proxyRes.on('data', chunk => body.push(chunk));
-            proxyRes.on('end', () => {
-                let data = Buffer.concat(body);
-                const contentType = proxyRes.headers['content-type'] || '';
-
-                // 圧縮解除
-                const enc = proxyRes.headers['content-encoding'];
-                if (enc === 'gzip') data = zlib.gunzipSync(data);
-                else if (enc === 'deflate') data = zlib.inflateSync(data);
-                else if (enc === 'br') data = zlib.brotliDecompressSync(data);
-
-                // HTMLの書き換え
-                if (contentType.includes('text/html')) {
-                    const dom = new JSDOM(data.toString());
-                    const doc = dom.window.document;
-
-                    // スクリプト注入
-                    const script = doc.createElement('script');
-                    script.src = this.prefix + 'client_hook';
-                    script.setAttribute('data-config', btoa(JSON.stringify({ 
-                        prefix: this.prefix, 
-                        url: targetUrl 
-                    })));
-                    doc.head.insertBefore(script, doc.head.firstChild);
+        // 1. <base>タグを挿入
+        $('head').prepend(`<base href="${urlObj.origin}${urlObj.pathname}">`);
+        
+        // 2. 接続の横取り（Hooking）スクリプトの注入
+        // fetch, XHR, WebSocketを上書きしてこのエンジンを介するように仕向ける
+        $('head').prepend(`
+            <script>
+                (function() {
+                    const targetOrigin = "${urlObj.origin}";
+                    // ここにクライアント側の通信をWebSocket経由にバイパスするロジックを実装可能
+                    // 現状はベースURLの解決と、標準APIのトラップ準備
+                    console.log("Stealth Engine: Network Hooking Active");
                     
-                    // JSの擬装 (location -> alloyLocation)
-                    const jsProxy = (str) => {
-                        return str.replace(/(,| |=|\()document.location(,| |=|\)|\.)/gi, str => str.replace('.location', '.alloyLocation'))
-                                  .replace(/(,| |=|\()window.location(,| |=|\)|\.)/gi, str => str.replace('.location', '.alloyLocation'))
-                                  .replace(/(,| |=|\()location(,| |=|\)|\.)/gi, str => str.replace('location', 'alloyLocation'));
+                    const originalFetch = window.fetch;
+                    window.fetch = function() {
+                        const arg = arguments;
+                        if (typeof arg === 'string' && !arg.startsWith('http')) {
+                            arguments = new URL(arg, window.location.href).href;
+                        }
+                        return originalFetch.apply(this, arguments);
                     };
+                })();
+            </script>
+        `);
 
-                    // 静的リソースの書き換え
-                    const rewrite = (tag, attr) => {
-                        doc.querySelectorAll(`${tag}[${attr}]`).forEach(el => {
-                            try {
-                                const raw = el.getAttribute(attr);
-                                if (raw.startsWith('javascript:')) return;
-                                const absolute = new URL(raw, targetUrl).href;
-                                el.setAttribute(attr, this.prefix + this.proxifyRequestURL(absolute, false));
-                            } catch(e) {}
-                        });
-                    };
+        // ゲーム用にCanvasを全画面表示にするスタイルを強制注入
+        $('head').append(`
+            <style>
+                body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+                canvas { display: block; width: 100vw; height: 100vh; }
+            </style>
+        `);
 
-                    rewrite('a', 'href');
-                    rewrite('link', 'href');
-                    rewrite('script', 'src');
-                    rewrite('img', 'src');
-                    rewrite('iframe', 'src');
-                    rewrite('form', 'action');
-                    rewrite('base', 'href');
-
-                    // インラインスクリプトの変換
-                    doc.querySelectorAll('script').forEach(s => {
-                        if (s.innerHTML) s.innerHTML = jsProxy(s.innerHTML);
-                    });
-
-                    data = dom.serialize();
-                }
-
-                // JSファイルの変換
-                if (contentType.includes('javascript')) {
-                    let jsStr = data.toString();
-                    jsStr = jsStr.replace(/(,| |=|\()document.location(,| |=|\)|\.)/gi, str => str.replace('.location', '.alloyLocation'))
-                                 .replace(/(,| |=|\()window.location(,| |=|\)|\.)/gi, str => str.replace('.location', '.alloyLocation'))
-                                 .replace(/(,| |=|\()location(,| |=|\)|\.)/gi, str => str.replace('location', 'alloyLocation'));
-                    data = Buffer.from(jsStr);
-                }
-
-                // レスポンスヘッダーのクリーンアップ
-                delete proxyRes.headers['content-encoding'];
-                delete proxyRes.headers['content-length'];
-                delete proxyRes.headers['content-security-policy'];
-                delete proxyRes.headers['x-frame-options'];
-
-                // Cookieのリライト (domain属性の調整)
-                if (proxyRes.headers['set-cookie']) {
-                    proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
-                        return cookie.replace(/Domain=(.*?);/gi, `Domain=${req.headers['host']};`);
-                    });
-                }
-
-                // リダイレクトの処理
-                if (proxyRes.headers['location']) {
+        // 3. a, img, link, script 等のURL属性を修正（絶対パス化）
+        $('a, img, link, script, source, iframe, form').each((i, el) => {
+            ['href', 'src', 'action'].forEach(attr => {
+                const val = $(el).attr(attr);
+                if (val && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith('javascript:')) {
                     try {
-                        const loc = new URL(proxyRes.headers['location'], targetUrl).href;
-                        proxyRes.headers['location'] = this.prefix + this.proxifyRequestURL(loc, false);
-                    } catch(e) {}
-                }
-
-                res.writeHead(proxyRes.statusCode, proxyRes.headers);
-                res.end(data);
-            });
-        });
-
-        proxyReq.on('error', (err) => {
-            res.writeHead(500);
-            res.end("Proxy Error: " + err.message);
-        });
-
-        req.pipe(proxyReq);
-    }
-
-    ws(server) {
-        const wss = new WebSocket.Server({ server });
-        wss.on('connection', (cli, req) => {
-            const urlObj = new URL(req.url, `http://${req.headers.host}`);
-            const query = querystring.parse(urlObj.search.slice(1));
-            
-            if (!query.ws) return cli.close();
-
-            const targetWsUrl = atob(query.ws);
-            const proxy = new WebSocket(targetWsUrl, {
-                headers: { 
-                    origin: query.origin ? atob(query.origin) : '',
-                    'User-Agent': req.headers['user-agent']
+                        $(el).attr(attr, new URL(val, targetUrl).href);
+                    } catch (e) {}
                 }
             });
-
-            cli.on('message', m => proxy.readyState === WebSocket.OPEN && proxy.send(m));
-            proxy.on('message', m => cli.readyState === WebSocket.OPEN && cli.send(m));
-            
-            cli.on('close', () => proxy.close());
-            proxy.on('close', () => cli.close());
-            
-            cli.on('error', () => proxy.terminate());
-            proxy.on('error', () => cli.terminate());
         });
+
+        // 4. インラインCSSのリライト
+        $('style').each((i, el) => {
+            const css = $(el).text();
+            $(el).text(rewriteCSS(css, targetUrl));
+        });
+
+        // 5. セキュリティポリシー(CSP)およびフレーム制限の解除
+        $('meta[http-equiv*="Content-Security-Policy" i]').remove();
+        $('meta[name*="viewport"]').attr('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no');
+
+        return $.html();
     }
-}
-
-// --- サーバー起動 ---
-const proxy = new AlloyProxy(config.prefix);
-
-const server = http.createServer((req, res) => {
-    // プロキシリクエストのハンドリング
-    if (req.url.startsWith(config.prefix)) {
-        return proxy.http(req, res);
+    
+    // CSSファイル単体のリライト
+    if (contentType.includes('text/css')) {
+        return rewriteCSS(content.toString(), targetUrl);
     }
 
-    // UIからのジャンプ処理
-    if (req.url.startsWith('/prox?url=')) {
+    // JSファイルのリライト
+    if (contentType.includes('javascript') || contentType.includes('application/x-javascript')) {
+        return rewriteJS(content.toString(), targetUrl);
+    }
+    
+    return content;
+};
+
+app.use(express.static('public'));
+
+wss.on('connection', (ws) => {
+    const jar = new Map();
+
+    ws.on('message', async (msg) => {
         try {
-            const urlParams = new URLSearchParams(req.url.split('?'));
-            const target = atob(urlParams.get('url'));
-            const finalTarget = target.startsWith('http') ? target : 'http://' + target;
-            res.writeHead(302, { Location: config.prefix + proxy.proxifyRequestURL(finalTarget, false) });
-            return res.end();
-        } catch(e) {
-            res.writeHead(400);
-            return res.end("Invalid Request");
-        }
-    }
+            const decrypted = transform(msg).toString();
+            const { url, method, headers, data } = JSON.parse(decrypted);
+            const urlObj = new URL(url);
+            const host = urlObj.hostname;
 
-    // 静的ファイル (index.html) の配信
-    const indexPath = path.join(__dirname, 'public', 'index.html');
-    fs.readFile(indexPath, (err, data) => {
-        if (err) {
-            res.writeHead(404);
-            res.end("index.html not found in public directory.");
-            return;
+            const res = await axios({
+                url,
+                method: method || 'GET',
+                data: data || null,
+                headers: {
+                    ...headers,
+                    'Cookie': jar.get(host) || '',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    'Referer': url,
+                    'Origin': urlObj.origin
+                },
+                responseType: 'arraybuffer',
+                validateStatus: false
+            });
+
+            if (res.headers['set-cookie']) {
+                jar.set(host, res.headers['set-cookie'].map(c => c.split(';')).join('; '));
+            }
+
+            let bodyData = res.data;
+            const contentType = res.headers['content-type'] || '';
+
+            // HTML, CSS, JavaScript の場合のみリライトを実行
+            if (contentType.includes('text/html') || 
+                contentType.includes('text/css') || 
+                contentType.includes('javascript')) {
+                bodyData = Buffer.from(rewriteResources(bodyData.toString(), url, contentType));
+            }
+
+            // バイナリ整合性を守るためBase64で送信
+            ws.send(transform(JSON.stringify({
+                body: bodyData.toString('base64'),
+                status: res.status,
+                contentType: contentType,
+                url: url
+            })));
+        } catch (e) {
+            ws.send(transform(JSON.stringify({ error: e.message })));
         }
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(data);
     });
 });
 
-// WebSocketの有効化
-proxy.ws(server);
-
-server.listen(config.port, () => {
-    console.log(`Sennin Proxy is active on port ${config.port}`);
-});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Stealth Engine active on port ${PORT}`));
