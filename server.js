@@ -23,57 +23,100 @@ const WINDOW_JS = `
     var alloy = JSON.parse(atob(document.currentScript.getAttribute('data-config')));
     alloy.url = new URL(alloy.url);
 
+    // "document.location" and "window.location" are rewritten server-side and replaced with this object.
     window.alloyLocation = new Proxy({}, {
         set(obj, prop, value) {
-            if (['assign', 'reload', 'replace', 'toString'].includes(prop)) return true;
+            if (prop == 'assign' || prop == 'reload' || prop == 'replace' || prop == 'toString') return true;
+            console.log(proxify.url(alloy.url.href.replace(alloy.url[prop], value)));
             return location[prop] = proxify.url(alloy.url.href.replace(alloy.url[prop], value));
         },
         get(obj, prop) {
+            // Discord support fix
+            if (alloy.url.origin == atob('aHR0cHM6Ly9kaXNjb3JkLmNvbQ==') && alloy.url.pathname == '/app') return window.location[prop];
+
             if (prop == 'assign' || prop == 'reload' || prop == 'replace' || prop == 'toString') return {
                 assign: arg => window.location.assign(proxify.url(arg)),
                 replace: arg => window.location.replace(proxify.url(arg)),
                 reload: () => window.location.reload(),
-                toString: () => alloy.url.href
+                toString: () => { return alloy.url.href }
             }[prop];
-            return alloy.url[prop];
-        }
+            else return alloy.url[prop];
+        }    
     });
 
     window.document.alloyLocation = window.alloyLocation;
 
+    Object.defineProperty(document, 'domain', {
+        get() { return alloy.url.hostname; },
+        set(value) { return value; }
+    });
+
     var proxify = {
         url: (url, type) => {
-            if (!url || url.match(/^(#|about:|data:|blob:|mailto:|javascript:)/)) return url;
+            if (!url || url.match(/^(#|about:|data:|blob:|mailto:|javascript:|{|\*)/) || url.startsWith(alloy.prefix) || url.startsWith(window.location.origin + alloy.prefix)) return url;
+
+            if (url.startsWith(window.location.origin + '/') && !url.startsWith(window.location.origin + alloy.prefix)) url = '/' + url.split('/').splice(3).join('/');
             if (url.startsWith('//')) url = 'http:' + url;
             if (url.startsWith('/') && !url.startsWith(alloy.prefix)) url = alloy.url.origin + url;
+
             try {
                 var u = new URL(url, alloy.url.href);
+                // Alloy URL Format: prefix + _b64origin_ + /path
                 return alloy.prefix + '_' + btoa(u.origin) + '_' + "/" + u.pathname + u.search + u.hash;
             } catch(e) { return url; }
         }
     };
 
+    // Proxify Element Attributes
+    const proxifyAttribute = (element_array, attribute_array) => {
+        element_array.forEach(element => {
+            if (element && element.prototype) {
+                const oldSetAttribute = element.prototype.setAttribute;
+                element.prototype.setAttribute = function(name, value) {
+                    if (attribute_array.includes(name.toLowerCase())) value = proxify.url(value);
+                    return oldSetAttribute.apply(this, [name, value]);
+                };
+                attribute_array.forEach(attr => {
+                    Object.defineProperty(element.prototype, attr, {
+                        set(value) { this.setAttribute(attr, value); },
+                        get() { return this.getAttribute(attr); }
+                    });
+                });
+            }
+        });
+    };
+
+    proxifyAttribute([window.HTMLAnchorElement, window.HTMLLinkElement, window.HTMLAreaElement], ['href']);
+    proxifyAttribute([window.HTMLScriptElement, window.HTMLIFrameElement, window.HTMLImageElement, window.HTMLVideoElement, window.HTMLAudioElement, window.HTMLSourceElement], ['src']);
+
     // Fetch / XHR / WebSocket Proxying
     let oldFetch = window.fetch;
     window.fetch = function(url, options) {
-        if (typeof url === 'string') url = proxify.url(url);
+        if (url) url = proxify.url(url);
         return oldFetch.apply(this, arguments);
     };
 
     let oldOpen = window.XMLHttpRequest.prototype.open;
     window.XMLHttpRequest.prototype.open = function(method, url) {
-        if (typeof url === 'string') url = proxify.url(url);
+        if (url) url = proxify.url(url);
         return oldOpen.apply(this, arguments);
     };
 
     window.WebSocket = new Proxy(window.WebSocket, {
         construct(target, args) {
             var protocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
-            var wsUrl = args;
-            args = protocol + location.host + alloy.prefix + '?ws=' + btoa(wsUrl) + '&origin=' + btoa(alloy.url.origin);
+            var originalUrl = args;
+            args = protocol + location.host + alloy.prefix + '?ws=' + btoa(originalUrl) + '&origin=' + btoa(alloy.url.origin);
             return Reflect.construct(target, args);
         }
     });
+
+    // History API Proxying
+    const oldPush = window.History.prototype.pushState;
+    window.History.prototype.pushState = function(state, title, url) {
+        if (url) url = proxify.url(url);
+        return oldPush.apply(this, [state, title, url]);
+    };
 
     document.currentScript.remove();
 })();
@@ -157,11 +200,19 @@ class AlloyProxy {
                     })));
                     doc.head.insertBefore(script, doc.head.firstChild);
                     
+                    // JSの擬装 (location -> alloyLocation)
+                    const jsProxy = (str) => {
+                        return str.replace(/(,| |=|\()document.location(,| |=|\)|\.)/gi, str => str.replace('.location', '.alloyLocation'))
+                                  .replace(/(,| |=|\()window.location(,| |=|\)|\.)/gi, str => str.replace('.location', '.alloyLocation'))
+                                  .replace(/(,| |=|\()location(,| |=|\)|\.)/gi, str => str.replace('location', 'alloyLocation'));
+                    };
+
                     // 静的リソースの書き換え
                     const rewrite = (tag, attr) => {
                         doc.querySelectorAll(`${tag}[${attr}]`).forEach(el => {
                             try {
                                 const raw = el.getAttribute(attr);
+                                if (raw.startsWith('javascript:')) return;
                                 const absolute = new URL(raw, targetUrl).href;
                                 el.setAttribute(attr, this.prefix + this.proxifyRequestURL(absolute, false));
                             } catch(e) {}
@@ -174,8 +225,23 @@ class AlloyProxy {
                     rewrite('img', 'src');
                     rewrite('iframe', 'src');
                     rewrite('form', 'action');
+                    rewrite('base', 'href');
+
+                    // インラインスクリプトの変換
+                    doc.querySelectorAll('script').forEach(s => {
+                        if (s.innerHTML) s.innerHTML = jsProxy(s.innerHTML);
+                    });
 
                     data = dom.serialize();
+                }
+
+                // JSファイルの変換
+                if (contentType.includes('javascript')) {
+                    let jsStr = data.toString();
+                    jsStr = jsStr.replace(/(,| |=|\()document.location(,| |=|\)|\.)/gi, str => str.replace('.location', '.alloyLocation'))
+                                 .replace(/(,| |=|\()window.location(,| |=|\)|\.)/gi, str => str.replace('.location', '.alloyLocation'))
+                                 .replace(/(,| |=|\()location(,| |=|\)|\.)/gi, str => str.replace('location', 'alloyLocation'));
+                    data = Buffer.from(jsStr);
                 }
 
                 // レスポンスヘッダーのクリーンアップ
@@ -183,6 +249,13 @@ class AlloyProxy {
                 delete proxyRes.headers['content-length'];
                 delete proxyRes.headers['content-security-policy'];
                 delete proxyRes.headers['x-frame-options'];
+
+                // Cookieのリライト (domain属性の調整)
+                if (proxyRes.headers['set-cookie']) {
+                    proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
+                        return cookie.replace(/Domain=(.*?);/gi, `Domain=${req.headers['host']};`);
+                    });
+                }
 
                 // リダイレクトの処理
                 if (proxyRes.headers['location']) {
@@ -208,12 +281,17 @@ class AlloyProxy {
     ws(server) {
         const wss = new WebSocket.Server({ server });
         wss.on('connection', (cli, req) => {
-            const query = querystring.parse(req.url.split('?'));
+            const urlObj = new URL(req.url, `http://${req.headers.host}`);
+            const query = querystring.parse(urlObj.search.slice(1));
+            
             if (!query.ws) return cli.close();
 
             const targetWsUrl = atob(query.ws);
             const proxy = new WebSocket(targetWsUrl, {
-                headers: { origin: query.origin ? atob(query.origin) : '' }
+                headers: { 
+                    origin: query.origin ? atob(query.origin) : '',
+                    'User-Agent': req.headers['user-agent']
+                }
             });
 
             cli.on('message', m => proxy.readyState === WebSocket.OPEN && proxy.send(m));
@@ -240,7 +318,8 @@ const server = http.createServer((req, res) => {
     // UIからのジャンプ処理
     if (req.url.startsWith('/prox?url=')) {
         try {
-            const target = atob(req.url.split('='));
+            const urlParams = new URLSearchParams(req.url.split('?'));
+            const target = atob(urlParams.get('url'));
             const finalTarget = target.startsWith('http') ? target : 'http://' + target;
             res.writeHead(302, { Location: config.prefix + proxy.proxifyRequestURL(finalTarget, false) });
             return res.end();
