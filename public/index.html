@@ -32,13 +32,13 @@
 <body>
     <div class="toolbar">
         <div style="color:#00e676; font-weight:bold; margin-right:5px;">STEALTH</div>
-        <input type="text" id="urlInput" placeholder="Enter Game URL..." onkeydown="if(event.key==='Enter') requestSite()">
+        <input type="text" id="urlInput" placeholder="Enter URL (e.g. google.com)" onkeydown="if(event.key==='Enter') requestSite()">
         <button onclick="requestSite()">GO</button>
     </div>
     
     <div id="view-container">
         <div class="loader" id="loader"></div>
-        <iframe id="viewer" sandbox="allow-same-origin allow-scripts allow-forms allow-pointer-lock"></iframe>
+        <iframe id="viewer" name="viewer" sandbox="allow-same-origin allow-scripts allow-forms allow-pointer-lock"></iframe>
     </div>
 
     <div class="status-bar" id="status">Ready</div>
@@ -48,40 +48,56 @@
         const status = document.getElementById('status');
         const loader = document.getElementById('loader');
 
-        // バックエンドの仕様に合わせてBase64エンコード
-        const btoa_url = (str) => btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        /**
+         * サーバー側の atob() で正しく解釈されるよう、
+         * Unicode 文字列を UTF-8 として Base64 エンコードする関数
+         */
+        function safeBtoa(str) {
+            return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (match, p1) => {
+                return String.fromCharCode('0x' + p1);
+            }));
+        }
 
         function requestSite() {
-            let url = document.getElementById('urlInput').value;
+            let url = document.getElementById('urlInput').value.trim();
             if (!url) return;
-            
-            // プロトコル補完
+
+            // プロトコルがない場合は補完（サーバー側のロジックに合わせる）
             if (!url.startsWith('http')) {
                 url = 'https://' + url;
             }
-            
-            status.innerText = "Tunneling request...";
+
+            status.innerText = "Initiating stealth tunnel...";
             loader.style.display = "block";
-            
-            // バックエンドの /prox エンドポイントへリダイレクトするように設定
-            // サーバー側の atob(urlParams.get('url')) に対応
-            const encodedUrl = btoa(url);
-            viewer.src = `/prox?url=${encodeURIComponent(encodedUrl)}`;
+
+            // バックエンドの /prox?url=... エンドポイントを利用
+            // サーバー側は atob(urlParams.get('url')) でデコードするため、標準 Base64 を渡す
+            try {
+                const encodedUrl = safeBtoa(url);
+                viewer.src = `/prox?url=${encodeURIComponent(encodedUrl)}`;
+            } catch (e) {
+                status.innerText = "Encoding Error";
+                loader.style.display = "none";
+            }
         }
 
         viewer.onload = () => {
             loader.style.display = "none";
             try {
-                const currentPath = viewer.contentWindow.location.pathname;
-                status.innerText = `Connected: ${currentPath}`;
+                // 同じドメイン内（プロキシ経由）であればパスを表示可能
+                const currentHref = viewer.contentWindow.location.href;
+                if (currentHref !== "about:blank") {
+                    status.innerText = "Connected via Proxy";
+                }
             } catch (e) {
-                status.innerText = "Connected (External Domain)";
+                // クロスドメイン制限にかかる場合は詳細を表示できない
+                status.innerText = "Session Active";
             }
         };
 
-        // iframe内からのナビゲーション要求をハンドル
+        // iframe 内からのメッセージ（ナビゲーション等）を処理
         window.addEventListener('message', (e) => {
-            if (e.data.type === 'nav') {
+            if (e.data && e.data.type === 'nav') {
                 document.getElementById('urlInput').value = e.data.url;
                 requestSite();
             }
@@ -89,3 +105,4 @@
     </script>
 </body>
 </html>
+
